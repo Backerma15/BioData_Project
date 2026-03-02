@@ -1,0 +1,7 @@
+boto3
+psycopg2-binary
+pandas
+streamlit
+plotly
+python-dotenv
+pytz

@@ -1,0 +1,5 @@
+# AWS SDK for S3 interactions
+boto3>=1.26.0
+
+# Note: psycopg2-binary is installed via AWS Lambda Layer (Klayers)
+# This keeps the deployment package smaller and avoids build complications
