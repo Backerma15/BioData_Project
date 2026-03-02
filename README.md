@@ -23,30 +23,36 @@ graph LR
     style C fill:#f96,stroke:#333,stroke-width:2px
     style D fill:#69b,stroke:#333,stroke-width:2px
     style E fill:#9cf,stroke:#333,stroke-width:2px
+```
 
-⚙️ How It Works:
-Data Generation: A Python simulator generates mock sensor readings (pH, Temperature, Dissolved Oxygen) and injects intentional anomalies to simulate equipment failure.
+---
 
-Event-Driven Ingestion: The CSV is uploaded to AWS S3, automatically triggering an AWS Lambda function.
+## ⚙️ How It Works
 
-In-Flight Data Sanitization: The Lambda function reads the CSV in memory using native Python modules (no heavy Pandas layer needed), validates the data, and skips impossible readings (e.g., Temp > 500°C).
+**Data Generation:** A Python simulator generates mock sensor readings (pH, Temperature, Dissolved Oxygen) and injects intentional anomalies to simulate equipment failure.
 
-Fault-Tolerant Storage: Clean data is pushed to an AWS RDS PostgreSQL database. The database insertion uses row-by-row transaction handling (commit/rollback) to ensure one bad row doesn't fail the entire batch.
+**Event-Driven Ingestion:** The CSV is uploaded to AWS S3, automatically triggering an AWS Lambda function.
 
-Real-Time Visualization: A Streamlit dashboard queries the RDS instance to display live batch trends, health metrics, and anomaly alerts.
+**In-Flight Data Sanitization:** The Lambda function reads the CSV in memory using native Python modules (no heavy Pandas layer needed), validates the data, and skips impossible readings (e.g., Temp > 500°C).
 
-🛠️ Tech Stack
-Language: Python 3.x
+**Fault-Tolerant Storage:** Clean data is pushed to an AWS RDS PostgreSQL database. The database insertion uses row-by-row transaction handling (commit/rollback) to ensure one bad row doesn't fail the entire batch.
 
-Cloud Infrastructure (AWS): S3, Lambda, RDS (PostgreSQL), IAM, VPC Security Groups
+**Real-Time Visualization:** A Streamlit dashboard queries the RDS instance to display live batch trends, health metrics, and anomaly alerts.
 
-Libraries: boto3 (AWS SDK), psycopg2-binary (Database Driver), streamlit (UI), plotly (Data Viz), python-dotenv (Security)
+---
 
+## 🛠️ Tech Stack
 
-🔒 Security Best Practices Implemented
-Zero-Trust Networking: The RDS database sits behind a strictly configured VPC Security Group, only allowing inbound traffic from my specific IP and the Lambda function's internal Security Group.
+- **Language:** Python 3.x
+- **Cloud Infrastructure (AWS):** S3, Lambda, RDS (PostgreSQL), IAM, VPC Security Groups
+- **Libraries:** boto3 (AWS SDK), psycopg2-binary (Database Driver), streamlit (UI), plotly (Data Viz), python-dotenv (Security)
 
-Credential Management: All database passwords and AWS keys are managed via .env files locally and Environment Variables in AWS Lambda.
+---
+
+## 🔒 Security Best Practices Implemented
+
+- **Zero-Trust Networking:** The RDS database sits behind a strictly configured VPC Security Group, only allowing inbound traffic from specific IP and Lambda's internal Security Group.
+- **Credential Management:** All database passwords and AWS keys are managed via .env files locally and Environment Variables in AWS Lambda.
 
 Least Privilege: The AWS Lambda execution role only has the exact permissions needed to read from the specific S3 bucket and write to CloudWatch logs.
 
