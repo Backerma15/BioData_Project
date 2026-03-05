@@ -269,9 +269,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 👨‍💻 Author
 
-**Built by:** Your Name  
-**LinkedIn:** [Your LinkedIn Profile]  
-**GitHub:** [Your GitHub Profile]
+**Built by:** Brandon Ackermann  
+**LinkedIn:** www.linkedin.com/in/brandon-ackermann-115aba3b3  
+**GitHub:** (https://github.com/Backerma15/BioData_Project)
 
 Feel free to reach out with questions or suggestions!
 
