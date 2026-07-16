@@ -1,0 +1,9 @@
+username:postgres
+password:865MH93NcCHZBTK
+
+biotech-lab-db.cav8wwgsabhd.us-east-1.rds.amazonaws.com
+
+DB_HOST = "biotech-lab-db.cav8wwgsabhd.us-east-1.rds.amazonaws.com"
+DB_NAME = "postgres"
+DB_USER = "postgres"
+DB_PASS = "A1erQDP3v5yQG2amSkVu" # Reminder: Change this after your final test!

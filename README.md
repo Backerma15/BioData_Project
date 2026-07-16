@@ -1,23 +1,59 @@
 # 🧬 Real-Time Bioreactor Monitoring Pipeline
 
-## 📖 Overview
-This project is an **Event-Driven Serverless ETL Pipeline** designed to ingest, clean, and visualize IoT sensor data from biotech laboratory instruments (bioreactors). It simulates real-time batch data generation, securely processes it through AWS cloud infrastructure, and displays actionable insights on a live Streamlit dashboard.
+An event-driven serverless pipeline for bioreactor sensor telemetry, built around **GxP data-integrity requirements** rather than throughput.
 
-The goal of this architecture is to ensure data integrity by filtering out anomalous equipment readings before they reach the data warehouse, providing scientists with reliable, real-time metrics.
+Every file processed writes an append-only audit-log record — timestamp, rows received, rows inserted, rows rejected, processing status, duration — so the fate of every record is reconstructable after the fact. Ingestion uses row-by-row transaction handling so a single malformed reading fails in isolation instead of aborting the batch and silently discarding good data.
+
+The design target is **ALCOA+** — attributable, legible, contemporaneous, original, accurate — the standard an FDA inspector applies to electronic records under 21 CFR Part 11. In a regulated lab, a pipeline that drops data quietly is worse than one that fails loudly; every decision below follows from that.
+
+**Stack:** Python · AWS (S3 → Lambda → RDS PostgreSQL) · Streamlit · Plotly
 
 ---
 
-## 🏗️ Architecture & Data Flow
+## 📋 Audit Trail & Compliance Design
 
-This diagram illustrates the automated, serverless data pipeline:
+### Append-only processing log
+
+Every S3 object processed by Lambda writes one record to `lambda_audit_logs`:
+
+| Field | Purpose |
+|---|---|
+| `log_id` | Unique identifier for the processing event |
+| `processed_at` | Timestamp of processing (contemporaneous record) |
+| `file_name` | Source CSV — links stored rows back to their origin |
+| `total_rows` | Records received |
+| `rows_inserted` | Records validated and stored |
+| `rows_skipped` | Records rejected at validation |
+| `errors_flagged` | Count of validation errors |
+| `processing_status` | `SUCCESS` / `PARTIAL` / `FAILED` |
+| `error_message` | Failure detail, where applicable |
+| `processing_duration_seconds` | Performance metric |
+
+The purpose is reconstruction. Given any row in `lab_readings`, you can identify the source file, when it was processed, and how many of its sibling records were rejected and why. Given any source file, you can account for every row it contained. **No record disappears without a corresponding entry explaining its absence** — that accounting is the entire point.
+
+### Validation rules
+
+Readings are rejected at ingestion when they fall outside physically possible ranges (e.g. temperature > 500 °C), indicating sensor or equipment fault rather than a real process excursion. Rejected rows are **counted and logged, not silently dropped** — the distinction matters, because a rejected reading is itself evidence that an instrument needs attention.
+
+### Dashboards
+
+- **`bioreactor_dashboard.py`** — live batch trends, sensor metrics, anomaly alerts
+- **`audit_dashboard.py`** — pipeline processing history, success rates, error logs
+
+The audit dashboard exists because in a regulated environment, *"was the data captured correctly?"* is a separate question from *"what does the data say?"*, and it needs its own answer.
+
+---
+
+## 🏗️ Architecture
 
 ```mermaid
 graph LR
-    A[Python Lab Simulator] -->|Uploads CSV Data| B(AWS S3 Bucket)
-    B -->|S3 Event Trigger| C{AWS Lambda}
-    C -->|Data Validation & Cleaning| D[(AWS RDS - PostgreSQL)]
-    D -->|SQL Queries| E[Streamlit Live Dashboard]
-    
+    A[Python Lab Simulator] -->|Uploads CSV| B(AWS S3 Bucket)
+    B -->|S3 PUT Event| C{AWS Lambda}
+    C -->|Validation & Cleaning| D[(AWS RDS - PostgreSQL)]
+    C -->|Audit Record| D
+    D -->|SQL| E[Streamlit Dashboards]
+
     style A fill:#f9f,stroke:#333,stroke-width:2px
     style B fill:#ff9,stroke:#333,stroke-width:2px
     style C fill:#f96,stroke:#333,stroke-width:2px
@@ -25,69 +61,95 @@ graph LR
     style E fill:#9cf,stroke:#333,stroke-width:2px
 ```
 
+**Data generation** — a Python simulator produces mock sensor readings (pH, temperature, dissolved oxygen) with intentional anomalies injected to simulate equipment failure.
+
+**Event-driven ingestion** — CSV upload to S3 triggers Lambda via a PUT event on the `raw_data/` prefix. No polling, no scheduler.
+
+**In-flight sanitization** — Lambda reads the CSV in memory using native Python modules (no Pandas layer required), validates each row, and rejects impossible readings.
+
+**Fault-tolerant storage** — clean rows are written to RDS PostgreSQL with per-row commit/rollback handling. One bad row cannot take down the batch.
+
+**Visualization** — Streamlit dashboards query RDS directly for live trends and audit history.
+
 ---
 
-## ⚙️ How It Works
+## 🔍 Data-Integrity Design Decisions
 
-**Data Generation:** A Python simulator generates mock sensor readings (pH, Temperature, Dissolved Oxygen) and injects intentional anomalies to simulate equipment failure.
+### Row-level transaction isolation
 
-**Event-Driven Ingestion:** The CSV is uploaded to AWS S3, automatically triggering an AWS Lambda function.
+**Problem:** a single anomalous row — a type mismatch, a malformed field — aborted the entire PostgreSQL transaction, discarding every valid row in the same CSV. From a data-integrity standpoint this is the worst possible failure mode: silent, total, and invisible downstream. An inspector asking *"where did batch 47 go?"* would have no answer.
 
-**In-Flight Data Sanitization:** The Lambda function reads the CSV in memory using native Python modules (no heavy Pandas layer needed), validates the data, and skips impossible readings (e.g., Temp > 500°C).
+**Solution:** decoupled the transaction boundary from the batch. Each row commits or rolls back independently inside the Lambda handler, and every rejection increments a counter that lands in the audit log. Good data survives; bad data is accounted for.
 
-**Fault-Tolerant Storage:** Clean data is pushed to an AWS RDS PostgreSQL database. The database insertion uses row-by-row transaction handling (commit/rollback) to ensure one bad row doesn't fail the entire batch.
+This is the pattern that makes the pipeline defensible rather than merely functional, and it is the single most important decision in the project.
 
-**Real-Time Visualization:** A Streamlit dashboard queries the RDS instance to display live batch trends, health metrics, and anomaly alerts.
+### Network isolation
+
+**Problem:** the RDS instance needed to be reachable from a local dev machine (DBeaver) and the Streamlit dashboards, without exposing a database holding lab records to the public internet.
+
+**Solution:** RDS sits in a VPC behind a security group permitting inbound 5432 only from a restricted CIDR block (developer IP) and the Lambda execution role's security group. All database connections use SSL/TLS. No public accessibility.
+
+### Environment parity
+
+**Problem:** credentials had to resolve identically in local development (`.env`) and in Lambda (environment variables), without branching logic that could drift between the two.
+
+**Solution:** `python-dotenv` with explicit path handling and `override=True`, so the same code path loads configuration in both environments.
 
 ---
 
 ## 🛠️ Tech Stack
 
-- **Language:** Python 3.x
-- **Cloud Infrastructure (AWS):** S3, Lambda, RDS (PostgreSQL), IAM, VPC Security Groups
-- **Libraries:** boto3 (AWS SDK), psycopg2-binary (Database Driver), streamlit (UI), plotly (Data Viz), python-dotenv (Security)
+- **Language:** Python 3.11
+- **AWS:** S3, Lambda, RDS (PostgreSQL), IAM, VPC Security Groups, CloudWatch
+- **Libraries:** `boto3`, `psycopg2-binary`, `streamlit`, `plotly`, `python-dotenv`
 
 ---
 
-## 🔒 Security Best Practices Implemented
+## 🔒 Security
 
-- **Zero-Trust Networking:** The RDS database sits behind a strictly configured VPC Security Group, only allowing inbound traffic from specific IP and Lambda's internal Security Group.
-- **Credential Management:** All database passwords and AWS keys are managed via .env files locally and Environment Variables in AWS Lambda.
+- **Network:** RDS is not publicly accessible. Inbound 5432 is restricted to a specific developer CIDR and the Lambda security group. SSL/TLS enforced on all connections.
+- **Credentials:** no secrets in source. Local config via `.env` (gitignored); Lambda config via environment variables.
+- **IAM:** the Lambda execution role is granted S3 read access to the ingestion bucket and CloudWatch Logs write access, plus an inline policy for RDS connectivity. See *Scope & Limitations* for how this would need to tighten in a production GxP deployment.
 
-Least Privilege: The AWS Lambda execution role only has the exact permissions needed to read from the specific S3 bucket and write to CloudWatch logs.
+---
 
-🚀 Local Setup & Installation
+## 🚀 Setup
 
 ### Prerequisites
+
 - Python 3.8+
-- AWS Account with S3, Lambda, RDS, and IAM access
-- PostgreSQL knowledge (basic)
+- AWS account with S3, Lambda, RDS, and IAM access
+- Basic PostgreSQL familiarity
 - Git
 
-### 1. Clone the Repository
+### 1. Clone
+
 ```bash
-git clone https://github.com/yourusername/BioData_Project.git
-cd BioData_Project
+git clone https://github.com/Backerma15/bioreactor-monitoring-pipeline.git
+cd bioreactor-monitoring-pipeline
 ```
 
-### 2. Create Virtual Environment
+### 2. Virtual environment
+
 ```bash
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 ```
 
-### 3. Install Dependencies
+### 3. Dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Configure Environment Variables
-Create a `.env` file in the root directory (use `.env.example` as a template):
+### 4. Configure environment
+
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and add your RDS credentials:
+Edit `.env`:
+
 ```
 DB_HOST=your-rds-endpoint.amazonaws.com
 DB_NAME=postgres
@@ -95,191 +157,115 @@ DB_USER=postgres
 DB_PASS=your_secure_password
 ```
 
-### 5. Create & Initialize RDS Database
-Before running the pipeline, create the required tables:
+> ⚠️ Never commit `.env`. It is already in `.gitignore`.
+
+### 5. Initialize the database
 
 ```bash
-# Using psql command line:
 psql -h your-rds-endpoint.amazonaws.com -U postgres -d postgres -f database_schema.sql
-
-# Or copy-paste the SQL from database_schema.sql into DBeaver's query editor
 ```
 
-This creates:
-- `lab_readings` - Main sensor data table
-- `lambda_audit_logs` - Audit trail of all processing events
-- Views for dashboard queries: `batch_summary`, `pipeline_health`
+Creates:
 
-### 6. Run the Data Simulator
-DB_HOST=your-rds-endpoint.amazonaws.com
-DB_NAME=postgres
-DB_USER=postgres
-DB_PASS=your_secure_password
-```
+- `lab_readings` — sensor data
+- `lambda_audit_logs` — processing audit trail
+- Views: `batch_summary`, `pipeline_health`
 
-**⚠️ IMPORTANT:** Never commit `.env` to version control. It's already in `.gitignore`.
+### 6. Generate and upload sample data
 
-### 5. Run the Data Simulator
-First, generate and upload mock sensor data to S3:
 ```bash
 python lab_instrument_simulator.py
 ```
 
-### 5. Launch the Dashboards
-**Main bioreactor monitoring dashboard:**
+### 7. Launch dashboards
+
 ```bash
-streamlit run bioreactor_dashboard.py
-```
-
-**Pipeline audit & health dashboard:**
-```bash
-streamlit run audit_dashboard.py
-```
-
-Both dashboards will open at `http://localhost:8501` (use different ports if running simultaneously)
-
----
-
-## 📋 Audit & Compliance
-
-### Lambda Audit Logging
-Every S3 file processed by Lambda creates an immutable audit log entry with:
-- **log_id** - Unique identifier for tracking
-- **processed_at** - Exact timestamp of processing
-- **file_name** - Source CSV file
-- **total_rows** - Records received
-- **rows_inserted** - Successfully validated & stored
-- **rows_skipped** - Records that failed validation
-- **errors_flagged** - Count of validation errors
-- **processing_status** - SUCCESS / PARTIAL / FAILED
-- **error_message** - Details if processing failed
-- **processing_duration_seconds** - Performance metric
-
-### Dashboard Monitoring
-- **Bioreactor Dashboard** (`bioreactor_dashboard.py`) - Real-time sensor metrics & batch health
-- **Audit Dashboard** (`audit_dashboard.py`) - Pipeline processing history, success rates, error logs
-
----
-
-## 🏗️ AWS Deployment & Configuration
-
-### AWS Infrastructure Required
-1. **S3 Bucket** - For raw CSV data ingestion (`lab-data-intake-2026`)
-2. **Lambda Function** - Triggered by S3 events to process and validate data
-3. **RDS PostgreSQL** - Stores cleaned data
-4. **Security Groups** - Control network access to RDS
-5. **IAM Role** - Least privilege permissions for Lambda
-
-### Setting Up AWS Resources
-
-#### A. Create RDS PostgreSQL Instance
-1. Go to AWS RDS Console
-2. Create a PostgreSQL database (Standard Create recommended)
-3. Configure VPC and Security Group
-4. Note the endpoint for `.env` file
-
-#### B. Create S3 Bucket
-1. Create a bucket named `lab-data-intake-2026`
-2. Enable versioning (optional, for data lineage)
-
-#### C. Create Lambda Function
-1. Create a new Python 3.11 runtime function
-2. Set environment variables:
-   - `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASS`
-   - Match those in `.env`
-3. Attach the following managed policies:
-   - `AmazonS3ReadOnlyAccess` (for reading from bucket)
-   - `CloudWatchLogsFullAccess` (for logging)
-4. Create inline policy for RDS access
-
-#### D. Configure S3 Event Trigger
-1. In Lambda, add trigger: S3 → `lab-data-intake-2026`
-2. Event type: `PUT`
-3. Prefix: `raw_data/`
-
-#### E. Set Up RDS Security Group
-Allow inbound traffic on port 5432 from:
-- Your local IP (for development)
-- Lambda Security Group (for AWS processing)
-- DBeaver/Dashboard IP (for visualization)
-
-### Monitoring & Logging
-- CloudWatch: Lambda execution logs
-- RDS: Enhanced monitoring for database health
-- Streamlit: Check terminal output for dashboard errors
-
----
-
-## 📚 Project Structure
-
-```
-BioData_Project/
-├── bioreactor_dashboard.py      # Streamlit dashboard for real-time monitoring
-├── lab_instrument_simulator.py  # Generates mock sensor data & uploads to S3
-├── requirements.txt             # Python dependencies
-├── .env.example                 # Template for environment variables
-├── .gitignore                   # Files to exclude from version control
-└── README.md                    # This file
+streamlit run bioreactor_dashboard.py          # monitoring
+streamlit run audit_dashboard.py --server.port 8502   # audit trail
 ```
 
 ---
 
-## � Challenges Overcome
+## ☁️ AWS Configuration
 
-### PostgreSQL Transaction Management
-Initially, a single anomalous row (e.g., mismatched data types) would abort the entire database transaction, causing data loss for the whole CSV. **Solution:** Decoupled transaction logic by implementing row-by-row `commit()` and `rollback()` handling inside the Lambda function to ensure continuous data flow even when individual rows fail.
+### RDS (PostgreSQL)
 
-### VPC & Network Security
-**Challenge:** Allowing secure remote access to RDS (via DBeaver and Streamlit) without exposing the database to the public internet.
-**Solution:** Configured AWS Security Groups with:
-- Restricted CIDR blocks for personal IP
-- Separate security group rules for Lambda execution role
-- SSL/TLS encryption for all database connections
+Create a PostgreSQL instance. Disable public accessibility. Note the endpoint for `.env`.
 
-### Environment Variable Management Across AWS & Local
-**Challenge:** Credentials needed to work seamlessly in both local `.env` and AWS Lambda environment variables.
-**Solution:** Used `python-dotenv` with explicit path handling and `override=True` flag to load variables consistently across all environments.
+### S3
+
+Create the ingestion bucket (`lab-data-intake-2026`). Versioning optional, useful for data lineage.
+
+### Lambda
+
+1. Python 3.11 runtime.
+2. Environment variables: `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASS`.
+3. Execution role: S3 read on the ingestion bucket, CloudWatch Logs write, inline policy for RDS access.
+4. Place in the same VPC as RDS.
+
+### S3 event trigger
+
+Lambda trigger → S3 → `lab-data-intake-2026`, event type `PUT`, prefix `raw_data/`.
+
+### RDS security group
+
+Inbound 5432 from:
+
+- developer IP (CIDR-restricted)
+- Lambda security group
+
+### Monitoring
+
+CloudWatch for Lambda execution logs; RDS Enhanced Monitoring for database health.
 
 ---
 
-## �🤝 Contributing
+## 📁 Project Structure
 
-This project is open for contributions! If you'd like to improve it:
+```
+bioreactor-monitoring-pipeline/
+├── lambda_function.py             # S3-triggered handler: validation, row-level commit, audit logging
+├── lab_instrument_simulator.py    # Generates mock sensor data with injected faults, uploads to S3
+├── bioreactor_dashboard.py        # Streamlit: live monitoring
+├── audit_dashboard.py             # Streamlit: pipeline audit trail & health
+├── database_schema.sql            # Tables (lab_readings, lambda_audit_logs) and views
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+---
 
-### Areas for Enhancement
-- Add unit tests for data validation logic
-- Implement data export to CSV from dashboard
-- Add email alerts for critical anomalies
-- Support for multiple bioreactor units
-- Grafana integration for advanced analytics
+## ⚖️ Scope & Limitations
+
+This is a **demonstration pipeline built to GxP data-integrity principles — it is not a validated system.** Stating the gap explicitly, because in a regulated environment the gap is the whole conversation:
+
+- **No validation lifecycle executed.** No URS, functional or design specification, IQ/OQ/PQ protocols, traceability matrix, or validation summary report. The architecture is designed to be validatable; it has not been validated.
+- **Audit log is append-only by convention, not enforced.** `lambda_audit_logs` is a standard PostgreSQL table — nothing at the database level prevents `UPDATE` or `DELETE`. True immutability would require revoking those grants from the application role, or writing to WORM storage (e.g. S3 Object Lock). This is the most significant gap between this project and a Part 11–compliant audit trail.
+- **No electronic signatures.** 21 CFR Part 11 Subpart C is out of scope entirely.
+- **Credentials via environment variables**, not AWS Secrets Manager with rotation. Acceptable for a demonstration; not for a GxP production system.
+- **IAM is scoped but not minimal.** Managed policies are used where an inline, resource-scoped policy would be correct for production.
+- **Simulated data.** Readings come from a generator, not real instrument output. Fault injection is synthetic and does not model real sensor drift.
+- **No automated tests** on the validation logic — the obvious next addition, and a prerequisite for any OQ.
+
+### Next steps
+
+- Unit tests for validation logic (prerequisite for OQ protocol authoring)
+- Database-level append-only enforcement on the audit table
+- Secrets Manager with rotation
+- Draft URS + traceability matrix against the existing implementation
 
 ---
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT — see `LICENSE`.
 
 ---
 
-## 👨‍💻 Author
+## 👤 Author
 
-**Built by:** Brandon Ackermann  
-**LinkedIn:** www.linkedin.com/in/brandon-ackermann-115aba3b3  
-**GitHub:** (https://github.com/Backerma15/BioData_Project)
+**Brandon Ackermann** — software engineer with a decade in FDA/USDA-regulated environments, eight of them as a federal inspector. This project comes out of watching lab and production data systems fail in ways that were entirely preventable.
 
-Feel free to reach out with questions or suggestions!
-
----
-
-## ⭐ Acknowledgments
-
-- AWS documentation for serverless architecture best practices
-- Streamlit community for excellent dashboard framework
-- PostgreSQL for robust data management
-
+[LinkedIn](https://www.linkedin.com/in/brandon-ackermann-115aba3b3) · [GitHub](https://github.com/Backerma15)
